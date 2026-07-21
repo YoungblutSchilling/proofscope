@@ -42,6 +42,7 @@ type Decision = {
   evidenceCoverage: number;
   nextSteps: { state: "strong" | "watch" | "risk"; action: string; evidence: string }[];
 };
+type GithubCommit = { sha: string; html_url: string; commit: { author: { date: string } | null } };
 
 type Assessment = {
   repository: string;
@@ -54,6 +55,7 @@ type Assessment = {
   dimensions: { name: string; score: number; max: number; rationale: string }[];
   signals: Signal[];
   decision: Decision;
+  integrationReceipt: { repository: string; branch: string; commit: { sha: string; url: string; authoredAt: string | null } | null; issuedAt: string };
   facts: { stars: number; forks: number; openIssues: number; lastPush: string | null; license: string; topics: string[] };
   evidence: { label: string; url: string }[];
 };
@@ -136,7 +138,7 @@ function decisionFor(
   return { state, label, rationale, evidenceCoverage: Math.round((coverage / 5) * 100), nextSteps };
 }
 
-export function buildAssessment(repo: GithubRepo, community: CommunityProfile | null, hasSecurity: boolean, latestRelease: { published_at: string } | null): Assessment {
+export function buildAssessment(repo: GithubRepo, community: CommunityProfile | null, hasSecurity: boolean, latestRelease: { published_at: string } | null, latestCommit: GithubCommit | null = null): Assessment {
   const pushedDays = daysSince(repo.pushed_at);
   const releaseDays = daysSince(latestRelease?.published_at ?? null);
   const activity = repo.archived ? 0 : pushedDays === null ? 4 : pushedDays <= 30 ? 25 : pushedDays <= 90 ? 19 : pushedDays <= 180 ? 12 : 5;
@@ -172,6 +174,7 @@ export function buildAssessment(repo: GithubRepo, community: CommunityProfile | 
     ],
     signals,
     decision,
+    integrationReceipt: { repository: repo.full_name, branch: repo.default_branch, commit: latestCommit ? { sha: latestCommit.sha, url: latestCommit.html_url, authoredAt: latestCommit.commit.author?.date || null } : null, issuedAt: new Date().toISOString() },
     facts: { stars: repo.stargazers_count, forks: repo.forks_count, openIssues: repo.open_issues_count, lastPush: repo.pushed_at, license: repo.license?.spdx_id || "No license", topics: repo.topics },
     evidence: [
       { label: "Repository", url: repo.html_url },
@@ -186,16 +189,17 @@ export function buildAssessment(repo: GithubRepo, community: CommunityProfile | 
 async function assess(repositoryInput: string, token?: string): Promise<Assessment> {
   const repository = normalizeRepository(repositoryInput);
   if (!repository) throw new Error("Use a public GitHub repository in owner/repo format.");
-  const [repoResult, communityResult, securityResult, releaseResult] = await Promise.all([
+  const [repoResult, communityResult, securityResult, releaseResult, commitResult] = await Promise.all([
     github<GithubRepo>(`/repos/${repository}`, token),
     github<CommunityProfile>(`/repos/${repository}/community/profile`, token),
     github<unknown>(`/repos/${repository}/contents/SECURITY.md`, token),
-    github<{ published_at: string }>(`/repos/${repository}/releases/latest`, token)
+    github<{ published_at: string }>(`/repos/${repository}/releases/latest`, token),
+    github<GithubCommit>(`/repos/${repository}/commits/HEAD`, token)
   ]);
   if (repoResult.response.status === 404) throw new Error("Repository not found or it is not public.");
   if (repoResult.response.status === 403) throw new Error("GitHub rate limit reached. Try again in a few minutes.");
   if (!repoResult.data) throw new Error(`GitHub returned ${repoResult.response.status}.`);
-  return buildAssessment(repoResult.data, communityResult.data, securityResult.response.ok, releaseResult.data);
+  return buildAssessment(repoResult.data, communityResult.data, securityResult.response.ok, releaseResult.data, commitResult.data);
 }
 
 async function compare(repositories: string[], token?: string): Promise<{ reports: Assessment[]; ranking: { rank: number; repository: string; score: number; grade: string; decision: DecisionState }[] }> {
