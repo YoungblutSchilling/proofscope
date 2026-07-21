@@ -1,5 +1,7 @@
 # ProofScope
 
+[简体中文](README.zh-CN.md)
+
 ProofScope is an evidence-first integration decision service for agents and development teams. It turns public GitHub signals into a transparent delivery brief with source links for every signal, a deterministic adoption recommendation, and explicit verification gates.
 
 ## What it does
