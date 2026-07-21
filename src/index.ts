@@ -73,7 +73,7 @@ function dateLabel(date: string | null): string | null {
 
 async function github<T>(path: string, token?: string): Promise<{ data: T | null; response: Response }> {
   const url = `https://api.github.com${path}`;
-  const cache = await caches.open("proofscope-github-v1");
+  const cache = await caches.open("proofscope-github-v2");
   const cached = await cache.match(url);
   if (cached) return { data: await cached.clone().json() as T, response: cached };
   const headers = token ? { ...GITHUB_HEADERS, authorization: `Bearer ${token}` } : GITHUB_HEADERS;
