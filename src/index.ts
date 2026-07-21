@@ -34,6 +34,14 @@ type CommunityProfile = {
 };
 
 type Signal = { label: string; state: "strong" | "watch" | "risk"; detail: string; evidence: string };
+type DecisionState = "proceed" | "review" | "block";
+type Decision = {
+  state: DecisionState;
+  label: string;
+  rationale: string;
+  evidenceCoverage: number;
+  nextSteps: { state: "strong" | "watch" | "risk"; action: string; evidence: string }[];
+};
 
 type Assessment = {
   repository: string;
@@ -45,6 +53,7 @@ type Assessment = {
   assessedAt: string;
   dimensions: { name: string; score: number; max: number; rationale: string }[];
   signals: Signal[];
+  decision: Decision;
   facts: { stars: number; forks: number; openIssues: number; lastPush: string | null; license: string; topics: string[] };
   evidence: { label: string; url: string }[];
 };
@@ -94,6 +103,39 @@ function gradeFor(score: number): string {
   return "D";
 }
 
+function decisionFor(
+  repo: GithubRepo,
+  activity: number,
+  documentation: number,
+  security: number,
+  maintenance: number,
+  release: number,
+  hasSecurity: boolean,
+  latestRelease: { published_at: string } | null,
+  score: number
+): Decision {
+  const coverage = [activity > 0, documentation > 0, security > 0, maintenance > 0, release > 0].filter(Boolean).length;
+  const nextSteps: Decision["nextSteps"] = [];
+  if (repo.archived) nextSteps.push({ state: "risk", action: "Do not select an archived repository for a new production dependency.", evidence: repo.html_url });
+  if (!repo.license) nextSteps.push({ state: "risk", action: "Resolve the license before redistribution or production adoption.", evidence: repo.html_url });
+  if (!hasSecurity) nextSteps.push({ state: "watch", action: "Confirm the maintainer's vulnerability-reporting path before integration.", evidence: `${repo.html_url}/security` });
+  if (activity < 19) nextSteps.push({ state: "watch", action: "Verify current maintenance ownership and pin an explicit commit before rollout.", evidence: `${repo.html_url}/commits/${repo.default_branch}` });
+  if (!latestRelease) nextSteps.push({ state: "watch", action: "Pin a reviewed commit and define an upgrade owner because no release was found.", evidence: `${repo.html_url}/releases` });
+  if (repo.open_issues_count > 100) nextSteps.push({ state: "watch", action: "Review the unresolved issue backlog for failures relevant to your integration.", evidence: `${repo.html_url}/issues` });
+  if (!nextSteps.length) nextSteps.push({ state: "strong", action: "Pin the reviewed release and retain these evidence links in the integration record.", evidence: `${repo.html_url}/releases` });
+
+  const block = repo.archived || !repo.license || (security < 7 && activity <= 5);
+  const proceed = !block && score >= 85 && security >= 14 && activity >= 19 && release >= 10;
+  const state: DecisionState = block ? "block" : proceed ? "proceed" : "review";
+  const label = state === "proceed" ? "Proceed with evidence" : state === "block" ? "Block pending resolution" : "Review before integration";
+  const rationale = state === "proceed"
+    ? "Core delivery, security, maintenance, and release signals meet the defined evidence threshold."
+    : state === "block"
+      ? "A production adoption blocker was found in the public evidence."
+      : "Public evidence is useful but incomplete or mixed; complete the listed checks before adoption.";
+  return { state, label, rationale, evidenceCoverage: Math.round((coverage / 5) * 100), nextSteps };
+}
+
 export function buildAssessment(repo: GithubRepo, community: CommunityProfile | null, hasSecurity: boolean, latestRelease: { published_at: string } | null): Assessment {
   const pushedDays = daysSince(repo.pushed_at);
   const releaseDays = daysSince(latestRelease?.published_at ?? null);
@@ -112,6 +154,7 @@ export function buildAssessment(repo: GithubRepo, community: CommunityProfile | 
     { label: "Issue load", state: issueState, detail: `${repo.open_issues_count.toLocaleString()} open issues reported by GitHub.`, evidence: `${repo.html_url}/issues` },
     { label: "Release cadence", state: release >= 10 ? "strong" : release > 0 ? "watch" : "risk", detail: latestRelease ? `Latest release published ${dateLabel(latestRelease.published_at)}.` : "No GitHub release was found.", evidence: `${repo.html_url}/releases` }
   ];
+  const decision = decisionFor(repo, activity, documentation, security, maintenance, release, hasSecurity, latestRelease, score);
   return {
     repository: repo.full_name,
     url: repo.html_url,
@@ -128,6 +171,7 @@ export function buildAssessment(repo: GithubRepo, community: CommunityProfile | 
       { name: "Release", score: release, max: 15, rationale: latestRelease ? `Latest release ${dateLabel(latestRelease.published_at)}` : "No release found" }
     ],
     signals,
+    decision,
     facts: { stars: repo.stargazers_count, forks: repo.forks_count, openIssues: repo.open_issues_count, lastPush: repo.pushed_at, license: repo.license?.spdx_id || "No license", topics: repo.topics },
     evidence: [
       { label: "Repository", url: repo.html_url },
@@ -154,6 +198,13 @@ async function assess(repositoryInput: string, token?: string): Promise<Assessme
   return buildAssessment(repoResult.data, communityResult.data, securityResult.response.ok, releaseResult.data);
 }
 
+async function compare(repositories: string[], token?: string): Promise<{ reports: Assessment[]; ranking: { rank: number; repository: string; score: number; grade: string; decision: DecisionState }[] }> {
+  if (repositories.length < 2 || repositories.length > 4) throw new Error("Provide two to four public repositories to compare.");
+  const reports = await Promise.all(repositories.map((repository) => assess(repository, token)));
+  const ranking = reports.slice().sort((a, b) => b.score - a.score).map((report, index) => ({ rank: index + 1, repository: report.repository, score: report.score, grade: report.grade, decision: report.decision.state }));
+  return { reports, ranking };
+}
+
 function mcpResponse(id: unknown, result: unknown): Response {
   return json({ jsonrpc: "2.0", id: id ?? null, result });
 }
@@ -164,7 +215,8 @@ async function handleMcp(request: Request, token?: string): Promise<Response> {
   if (body.method === "initialize") return mcpResponse(body.id, { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "ProofScope", version: "1.0.0" } });
   if (body.method === "tools/list") return mcpResponse(body.id, { tools: [
     { name: "assess_repository", description: "Produce an evidence-backed health and release-risk report for a public GitHub repository.", inputSchema: { type: "object", properties: { repository: { type: "string", description: "Public GitHub repository in owner/repo format." } }, required: ["repository"] } },
-    { name: "compare_repositories", description: "Compare two to four public GitHub repositories using the same transparent scoring model.", inputSchema: { type: "object", properties: { repositories: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 4 } }, required: ["repositories"] } }
+    { name: "compare_repositories", description: "Compare two to four public GitHub repositories using the same transparent scoring model.", inputSchema: { type: "object", properties: { repositories: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 4 } }, required: ["repositories"] } },
+    { name: "assess_integration_risk", description: "Turn public repository evidence into a deterministic proceed, review, or block decision with linked verification steps for an AI agent.", inputSchema: { type: "object", properties: { repository: { type: "string", description: "Public GitHub repository in owner/repo format." }, intended_use: { type: "string", description: "Optional integration context such as runtime dependency, build tool, or plugin." } }, required: ["repository"] } }
   ] });
   if (body.method === "tools/call") {
     const name = body.params?.name;
@@ -176,9 +228,11 @@ async function handleMcp(request: Request, token?: string): Promise<Response> {
       }
       if (name === "compare_repositories") {
         const repositories = Array.isArray(args.repositories) ? args.repositories.map(String) : [];
-        if (repositories.length < 2 || repositories.length > 4) throw new Error("Provide two to four repositories.");
-        const reports = await Promise.all(repositories.map((repository) => assess(repository, token)));
-        return mcpResponse(body.id, { content: [{ type: "text", text: JSON.stringify({ reports, ranking: reports.slice().sort((a, b) => b.score - a.score).map((report, index) => ({ rank: index + 1, repository: report.repository, score: report.score, grade: report.grade })) }, null, 2) }] });
+        return mcpResponse(body.id, { content: [{ type: "text", text: JSON.stringify(await compare(repositories, token), null, 2) }] });
+      }
+      if (name === "assess_integration_risk") {
+        const report = await assess(String(args.repository || ""), token);
+        return mcpResponse(body.id, { content: [{ type: "text", text: JSON.stringify({ intendedUse: String(args.intended_use || "general integration"), decision: report.decision, report }, null, 2) }] });
       }
       return json({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32601, message: "Unknown tool." } }, 404);
     } catch (error) {
@@ -196,6 +250,10 @@ export default {
     if (url.pathname === "/api/analyze") {
       try { return json(await assess(url.searchParams.get("repo") || "", env.GITHUB_TOKEN)); }
       catch (error) { return json({ error: error instanceof Error ? error.message : "Assessment failed." }, 400); }
+    }
+    if (url.pathname === "/api/compare") {
+      try { return json(await compare(url.searchParams.getAll("repo"), env.GITHUB_TOKEN)); }
+      catch (error) { return json({ error: error instanceof Error ? error.message : "Comparison failed." }, 400); }
     }
     if (url.pathname === "/mcp") {
       if (request.method !== "POST") return json({ name: "ProofScope MCP", protocol: "JSON-RPC 2.0", endpoint: "/mcp", tools: ["assess_repository", "compare_repositories"] });

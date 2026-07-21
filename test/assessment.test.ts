@@ -11,6 +11,14 @@ describe("buildAssessment", () => {
     expect(report.score).toBeLessThanOrEqual(100);
     expect(report.grade).toBe("A");
     expect(report.signals).toHaveLength(5);
+    expect(report.decision.state).toBe("proceed");
+    expect(report.decision.evidenceCoverage).toBe(100);
     expect(report.evidence.every((item) => item.url.startsWith("https://github.com/"))).toBe(true);
+  });
+
+  it("blocks archived repositories instead of hiding the adoption risk behind a score", () => {
+    const report = buildAssessment({ ...repo, archived: true, pushed_at: "2024-01-01T00:00:00Z" }, { health_percentage: 100, files: { readme: "README.md", contributing: "CONTRIBUTING.md", issue_template: ".github/ISSUE_TEMPLATE", code_of_conduct: "CODE_OF_CONDUCT.md", license: "LICENSE" } }, true, { published_at: "2026-07-10T00:00:00Z" });
+    expect(report.decision.state).toBe("block");
+    expect(report.decision.nextSteps[0].action).toContain("archived");
   });
 });
